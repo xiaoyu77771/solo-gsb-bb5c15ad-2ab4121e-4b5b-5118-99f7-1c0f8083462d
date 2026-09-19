@@ -6,6 +6,7 @@ from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
 
+from . import receipts
 from . import service
 from .calibration import CalibrationError
 from .db import init_db
@@ -25,6 +26,12 @@ from .models import (
     ObservationReviseIn,
     RevisionOut,
     Timestamp,
+)
+from .receipts import (
+    CorrectionReceiptIn,
+    CorrectionReceiptOut,
+    CorrectionReceiptVerifyIn,
+    CorrectionReceiptVerifyOut,
 )
 from .service import (
     DuplicateTimestampError,
@@ -158,6 +165,33 @@ def post_correction(payload: CorrectionIn) -> dict:
         return service.correct(ts=payload.timestamp, reading=payload.reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/correction-receipts", response_model=CorrectionReceiptOut)
+def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
+    """对漂移补偿结果签发版本化 HMAC 回执（复用 /corrections 的补偿逻辑）。
+
+    返回 version=1、归一化请求（timestamp 统一为 Unix 秒）、bias、corrected、
+    UTC Unix 毫秒整数 issued_at，以及对
+    [version,timestamp,reading,bias,corrected,issued_at] 做 HMAC-SHA256
+    （密钥取自 CORRECTION_RECEIPT_SECRET）得到的小写十六进制 receipt。
+    覆盖范围外与 /corrections 一样返回 400。
+    """
+    try:
+        return receipts.issue_receipt(ts=payload.timestamp, reading=payload.reading)
+    except OutOfCoverageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/correction-receipts/verify", response_model=CorrectionReceiptVerifyOut)
+def post_correction_receipt_verify(payload: CorrectionReceiptVerifyIn) -> dict:
+    """校验完整回执：重算签名并以常量时间比较。
+
+    任一签名字段（version/request.timestamp/request.reading/bias/corrected/
+    issued_at/receipt）被改动返回 {"valid": false}；结构缺失或类型错误
+    （如字符串冒充数值、issued_at 为小数）由 Pydantic strict 校验拒绝为 422。
+    """
+    return {"valid": receipts.verify_receipt(payload)}
 
 
 @app.get("/historical-correction", response_model=HistoricalCorrectionOut)
