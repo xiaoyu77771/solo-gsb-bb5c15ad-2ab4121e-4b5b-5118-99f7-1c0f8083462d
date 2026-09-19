@@ -8,11 +8,13 @@
 docker compose up --build
 ```
 
-- **API 地址：http://localhost:8000**
+- **API 地址：http://localhost:8000**（容器端口 8000 映射到宿主机 8000）
 - 交互式文档（Swagger UI）：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
 
 SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.db`），容器重启数据不丢。
+
+校正回执的签名密钥由 `CORRECTION_RECEIPT_SECRET` 提供：Compose 已内置开发默认值，开箱即用；生产部署用同名环境变量覆盖（`CORRECTION_RECEIPT_SECRET=<随机密钥> docker compose up -d --build`），详见「校正回执」一节。
 
 ## 校准规则
 
@@ -29,6 +31,7 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 11. **漂移稳定窗口分析**：`GET /drift-stability-window?from=&to=&max_spread=` 在覆盖范围内**解析求出** `max(bias) − min(bias) ≤ max_spread` 的持续时间最长的连续子区间：最优窗口必是某临界带宽 `[m, m+max_spread]` 的连通分量（`m` 取遍折点取值及其下移 `max_spread` 的值），分量边界由线性段与带宽边缘的解析交点精确定位，可落在插值段内部，不做固定步长采样；时长并列时返回起点最早者。响应含起止时刻、`duration_seconds` 与窗口内实际达到的 `min_bias`/`max_bias`。`from` 必须小于 `to`、`max_spread` 必须为正数，任一边界越界返回 400。
 12. **历史时点漂移补偿**：`GET /historical-correction?effective_at=&as_of=&reading=` 按 `as_of` 系统时点重建校准状态后，对目标观测时点 `effective_at` 的读数做漂移补偿。重建依据 `observations.created_at`、当前版本与 `revisions` 快照：`created_at > as_of` 的观测尚未创建、不参与；修订自 `changed_at` 起生效（恰等于 `changed_at` 时使用新版本），`changed_at > as_of` 的修订一律回滚到快照旧值。随后按重建出的观测时点排序，沿用与 `/corrections` 相同的覆盖范围与线性插值规则。查询**只读**，不改写当前观测、修订历史或区间表；响应附带 `as_of` 及所用端点的观测 ID 与版本。
 13. **观测影响预演**：`POST /observation-impact-preview` 接收一条**不落库**的候选观测与正数 `impact_limit`，沿用现有异常判定算出候选偏差，预演插入对当前分段线性偏差曲线的影响。仅在候选时点两侧都已有观测时预演（候选时点已占用或无法形成双侧邻点均返回 409）：插入只会把左右最近观测之间的区间重新分段，受影响范围即 `[prev, next]`；曲线变化量 Δ 是折点 `(prev, 0) → (候选, Δc) → (next, 0)` 的分段线性函数，返回受影响时间范围、最大绝对偏差变化及其最早发生时点，以及 `|Δ| > impact_limit` 的连续区间（阈值交点解析求解，恰等于阈值的瞬时不计入，不做固定步长采样）。请求**只读**，不改写观测、修订历史或区间表。
+14. **校正回执**：`POST /correction-receipts` 复用与 `/corrections` 完全相同的漂移补偿（覆盖范围外同样返回 400），在补偿结果之外签发防篡改回执：响应含 `version`（恒为 1）、归一化请求（`timestamp`/`reading`）、`bias`、`corrected`、`issued_at`（UTC Unix 毫秒整数）与 `receipt` 签名。签名载荷按 `version`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 的固定字段顺序，以 JSON 数值最短十进制、UTF-8 无空白编码后计算 **HMAC-SHA256 小写十六进制**；密钥读取环境变量 `CORRECTION_RECEIPT_SECRET`。`POST /correction-receipts/verify` 接收完整回执，重算签名并做**常量时间比较**：任一签名字段（或 `receipt` 本身）被改动即返回 `valid=false`；结构或类型错误返回 422。
 
 ## API 一览
 
@@ -41,6 +44,8 @@ SQLite 数据落在命名卷 `calibration-data`（容器内 `/data/calibration.d
 | POST | `/observation-impact-preview` | 预演插入一条观测（不落库）对偏差曲线的影响：受影响范围、最大绝对变化与超阈值区间 |
 | GET | `/intervals` | 列出当前插值区间 |
 | POST | `/corrections` | 对指定时点的读数做漂移补偿 |
+| POST | `/correction-receipts` | 漂移补偿并签发带 HMAC-SHA256 签名的校正回执 |
+| POST | `/correction-receipts/verify` | 校验完整校正回执（常量时间比较），返回 `valid` |
 | GET | `/historical-correction` | 按 `as_of` 系统时点重建校准状态，对目标时点读数做漂移补偿（只读） |
 | GET | `/drift-integral` | 对覆盖范围内分段线性偏差做精确积分（累计漂移量） |
 | GET | `/drift-exceedances` | 解析求解偏差越出 ±limit 的连续区间（方向/持续秒数/峰值） |
@@ -184,6 +189,56 @@ curl -X POST http://localhost:8000/corrections \
   ]
 }
 ```
+
+### 校正回执
+
+`POST /correction-receipts` 复用与 `/corrections` 相同的漂移补偿（覆盖范围外返回 400），并签发带签名的回执。响应即完整回执，可直接回传给校验接口：
+
+```bash
+curl -X POST http://localhost:8000/correction-receipts \
+  -H 'Content-Type: application/json' \
+  -d '{"timestamp": "2026-09-18T09:00:00Z", "reading": 98.0}'
+```
+
+```json
+{
+  "version": 1,
+  "timestamp": 1789722000.0, "reading": 98.0,
+  "bias": 2.0, "corrected": 100.0,
+  "issued_at": 1789722600123,
+  "receipt": "337c3e1534e6f601b1639ed90fc3833b011b7bf397924ab20dcae5d1f9f1e1c4"
+}
+```
+
+**签名规则**：签名载荷为按 `version`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at` 固定字段顺序排列的 JSON 对象，数值取最短十进制表示、UTF-8 编码、无空白，对其计算 **HMAC-SHA256** 并输出小写十六进制。上例的载荷即（示例回执值按开发默认密钥计算，覆盖密钥后不再匹配）：
+
+```
+{"version":1,"timestamp":1789722000.0,"reading":98.0,"bias":2.0,"corrected":100.0,"issued_at":1789722600123}
+```
+
+校验时把完整回执原样回传；服务重算签名并与 `receipt` 做常量时间比较：
+
+```bash
+curl -X POST http://localhost:8000/correction-receipts/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"version": 1, "timestamp": 1789722000.0, "reading": 98.0,
+       "bias": 2.0, "corrected": 100.0, "issued_at": 1789722600123,
+       "receipt": "337c3e1534e6f601b1639ed90fc3833b011b7bf397924ab20dcae5d1f9f1e1c4"}'
+```
+
+```json
+{"valid": true}
+```
+
+任一签名字段（`version`、`timestamp`、`reading`、`bias`、`corrected`、`issued_at`）或 `receipt` 本身被改动都返回 `{"valid": false}`；缺字段、类型错误等结构问题返回 422。校验是纯签名检查，不读取数据库。
+
+**密钥管理**：签名密钥读取环境变量 `CORRECTION_RECEIPT_SECRET`。`docker-compose.yml` 已提供开发默认值 `dev-correction-receipt-secret`（与代码内置的本地缺省一致），开箱即用；**生产部署必须覆盖**，用同名环境变量注入随机密钥，例如：
+
+```bash
+CORRECTION_RECEIPT_SECRET=$(openssl rand -hex 32) docker compose up -d --build
+```
+
+更换密钥后，旧密钥签发的回执校验将返回 `{"valid": false}`。
 
 ### 历史时点漂移补偿（as_of 状态重建）
 
@@ -354,10 +409,10 @@ curl "http://localhost:8000/drift-stability-window?from=2026-09-18T08:00:00Z&to=
 
 | 状态码 | 场景 |
 | --- | --- |
-| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0` |
+| 400 | 查询时点超出校准覆盖范围（响应含可用区间；历史补偿按重建后的覆盖范围判定）；积分/超限/稳定窗口 `from ≥ to` 或任一边界越界；超限阈值 `limit ≤ 0`；稳定窗口 `max_spread ≤ 0`；预算耗尽起点 `from` 越界或 `budget ≤ 0`；影响预演 `impact_limit ≤ 0`；签发校正回执时时点越出覆盖范围 |
 | 404 | 修订/查询修订历史时观测 ID 不存在 |
 | 409 | 同一时点重复登记观测；修订时版本过期或目标时点已被占用；影响预演候选时点已占用或两侧无法形成邻点 |
-| 422 | 读数不足 3 次、全部读数被判异常、参数非法 |
+| 422 | 读数不足 3 次、全部读数被判异常、参数非法；校正回执校验请求缺字段或类型错误（签名字段被改动不属此类，返回 200 且 `valid=false`） |
 
 ## 本地开发
 
@@ -367,17 +422,20 @@ python -m pytest tests/ -q          # 运行测试
 uvicorn app.main:app --reload       # 本地启动（默认 ./calibration.db）
 ```
 
-环境变量 `CALIB_DB_PATH` 可覆盖 SQLite 文件路径（容器内默认 `/data/calibration.db`）。
+环境变量 `CALIB_DB_PATH` 可覆盖 SQLite 文件路径（容器内默认 `/data/calibration.db`）；`CORRECTION_RECEIPT_SECRET` 可覆盖校正回执签名密钥（缺省为开发默认值 `dev-correction-receipt-secret`，生产环境必须覆盖，见「校正回执」一节）。
 
 ## 项目结构
 
 ```
 app/
   main.py         # FastAPI 路由
-  service.py      # 观测入库、相邻区间重算、补偿查询、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演
+  service.py      # 观测入库、相邻区间重算、补偿查询、校正回执签发与校验、as_of 历史状态重建、漂移积分、超限窗口分析、预算耗尽分析、稳定窗口分析、观测影响预演
   calibration.py  # 纯计算：异常判定、偏差、线性插值、分段积分、超限交点求解、预算累积反解、稳定窗口求解、插入影响解析比较
+  receipts.py     # 纯函数：回执签名载荷编码、HMAC-SHA256 签发与常量时间校验、密钥读取
   models.py       # Pydantic 请求/响应模型
   db.py           # SQLite 连接与建表
-tests/test_api.py # 端到端 API 测试
+tests/
+  test_api.py                # 端到端 API 测试
+  test_correction_receipts.py # 校正回执签发/校验测试
 Dockerfile / docker-compose.yml
 ```

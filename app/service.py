@@ -7,6 +7,7 @@ import time
 from contextlib import closing
 
 from . import calibration
+from . import receipts
 from .db import connect
 from .models import epoch_to_iso
 
@@ -362,6 +363,45 @@ def _endpoint_dict(conn: sqlite3.Connection, obs: sqlite3.Row) -> dict:
         "bias": obs["bias"],
         "outliers": [r["value"] for r in outliers],
     }
+
+
+# ---------- 校正回执 ----------
+
+def issue_correction_receipt(ts: float, reading: float) -> dict:
+    """复用漂移补偿算出 bias/corrected，签发带 HMAC-SHA256 签名的校正回执。
+
+    覆盖范围判定与 /corrections 完全一致（越界抛 OutOfCoverageError）。响应即完整
+    回执：归一化请求（timestamp/reading）、补偿结果、签发时间（UTC Unix 毫秒整数）
+    与签名；签名载荷字段顺序与编码规则见 receipts.signature_payload。
+    """
+    result = correct(ts, reading)
+    issued_at = int(time.time() * 1000)  # UTC Unix 毫秒整数
+    bias = result["bias"]
+    corrected = result["corrected"]
+    return {
+        "version": receipts.RECEIPT_VERSION,
+        "timestamp": ts,
+        "reading": reading,
+        "bias": bias,
+        "corrected": corrected,
+        "issued_at": issued_at,
+        "receipt": receipts.sign_receipt(
+            receipts.RECEIPT_VERSION, ts, reading, bias, corrected, issued_at
+        ),
+    }
+
+
+def verify_correction_receipt(
+    version: int, timestamp: float, reading: float, bias: float,
+    corrected: float, issued_at: int, receipt: str,
+) -> dict:
+    """按提交的签名字段重算回执，与提交的 receipt 做常量时间比较。
+
+    纯签名校验，不触碰数据库：任一签名字段（或 receipt 本身）被改动都会得到
+    valid=false；结构或类型错误在请求模型层被拦为 422。
+    """
+    expected = receipts.sign_receipt(version, timestamp, reading, bias, corrected, issued_at)
+    return {"valid": receipts.constant_time_equal(expected, receipt)}
 
 
 # ---------- 历史时点漂移补偿（as_of 状态重建） ----------

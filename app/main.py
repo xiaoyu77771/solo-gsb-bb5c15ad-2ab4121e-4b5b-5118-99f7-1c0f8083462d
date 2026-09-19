@@ -12,6 +12,10 @@ from .db import init_db
 from .models import (
     CorrectionIn,
     CorrectionOut,
+    CorrectionReceiptIn,
+    CorrectionReceiptOut,
+    CorrectionReceiptVerifyIn,
+    CorrectionReceiptVerifyOut,
     DriftBudgetDepletionOut,
     DriftExceedancesOut,
     DriftIntegralOut,
@@ -158,6 +162,40 @@ def post_correction(payload: CorrectionIn) -> dict:
         return service.correct(ts=payload.timestamp, reading=payload.reading)
     except OutOfCoverageError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/correction-receipts", response_model=CorrectionReceiptOut)
+def post_correction_receipt(payload: CorrectionReceiptIn) -> dict:
+    """对指定时点的读数做漂移补偿，并签发带 HMAC-SHA256 签名的校正回执。
+
+    响应即完整回执：version（恒为 1）、归一化请求（timestamp/reading）、bias、
+    corrected、issued_at（UTC Unix 毫秒整数）与 receipt 签名。签名载荷按
+    version、timestamp、reading、bias、corrected、issued_at 顺序，以 JSON 数值
+    最短十进制、UTF-8 无空白编码后计算 HMAC-SHA256 小写十六进制；密钥读取
+    环境变量 CORRECTION_RECEIPT_SECRET。覆盖范围外拒绝（400）。
+    """
+    try:
+        return service.issue_correction_receipt(ts=payload.timestamp, reading=payload.reading)
+    except OutOfCoverageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/correction-receipts/verify", response_model=CorrectionReceiptVerifyOut)
+def post_correction_receipt_verify(payload: CorrectionReceiptVerifyIn) -> dict:
+    """校验完整校正回执：重算签名并与提交的 receipt 常量时间比较。
+
+    任一签名字段（version、timestamp、reading、bias、corrected、issued_at）或
+    receipt 本身被改动均返回 valid=false；结构或类型错误返回 422。
+    """
+    return service.verify_correction_receipt(
+        version=payload.version,
+        timestamp=payload.timestamp,
+        reading=payload.reading,
+        bias=payload.bias,
+        corrected=payload.corrected,
+        issued_at=payload.issued_at,
+        receipt=payload.receipt,
+    )
 
 
 @app.get("/historical-correction", response_model=HistoricalCorrectionOut)

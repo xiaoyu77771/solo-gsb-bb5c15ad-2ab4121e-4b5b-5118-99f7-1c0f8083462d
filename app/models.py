@@ -62,6 +62,23 @@ class ObservationImpactPreviewIn(ObservationIn):
     impact_limit: float = Field(description="影响阈值（正数）：|偏差变化| 严格大于该值才计入影响区间")
 
 
+class CorrectionReceiptIn(BaseModel):
+    timestamp: Timestamp = Field(description="待校正读数的时点：Unix 秒或 ISO 8601")
+    reading: float = Field(description="待校正的原始读数")
+
+
+class CorrectionReceiptVerifyIn(BaseModel):
+    """完整校正回执：签名字段原样回传，receipt 为待校验签名。"""
+
+    version: int = Field(description="回执格式版本")
+    timestamp: Timestamp = Field(description="回执中的归一化时点（Unix 秒或 ISO 8601）")
+    reading: float = Field(description="回执中的归一化原始读数")
+    bias: float = Field(description="回执中的插值校准偏差")
+    corrected: float = Field(description="回执中的校正读数")
+    issued_at: int = Field(description="回执签发时间：UTC Unix 毫秒整数")
+    receipt: str = Field(description="待校验的 HMAC-SHA256 小写十六进制签名")
+
+
 # ---------- 响应 ----------
 
 class ReadingOut(BaseModel):
@@ -226,6 +243,22 @@ class DriftStabilityWindowOut(BaseModel):
     duration_seconds: float = Field(description="稳定持续秒数（t_end − t_start）")
     min_bias: float = Field(description="子区间内 bias 实际达到的最小值")
     max_bias: float = Field(description="子区间内 bias 实际达到的最大值")
+
+
+class CorrectionReceiptOut(BaseModel):
+    """签发的校正回执：归一化请求、补偿结果、签发时间与签名。"""
+
+    version: int = Field(description="回执格式版本，当前恒为 1")
+    timestamp: float = Field(description="归一化后的待校正时点（Unix 秒）")
+    reading: float = Field(description="归一化后的原始读数")
+    bias: float = Field(description="该时点的插值校准偏差")
+    corrected: float = Field(description="校正读数 = reading + bias")
+    issued_at: int = Field(description="签发时间：UTC Unix 毫秒整数")
+    receipt: str = Field(description="对签名字段的 HMAC-SHA256 小写十六进制签名")
+
+
+class CorrectionReceiptVerifyOut(BaseModel):
+    valid: bool = Field(description="签名是否有效：任一签名字段或 receipt 被改动即为 false")
 
 
 class ImpactIntervalOut(BaseModel):

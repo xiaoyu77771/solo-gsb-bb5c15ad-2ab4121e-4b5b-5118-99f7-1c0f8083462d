@@ -5,6 +5,8 @@ services:
       - "8000:8000"
     environment:
       CALIB_DB_PATH: /data/calibration.db
+      # 校正回执 HMAC 密钥：开发默认值，生产部署时用同名环境变量覆盖
+      CORRECTION_RECEIPT_SECRET: ${CORRECTION_RECEIPT_SECRET:-dev-correction-receipt-secret}
     volumes:
       - calibration-data:/data
     restart: unless-stopped
